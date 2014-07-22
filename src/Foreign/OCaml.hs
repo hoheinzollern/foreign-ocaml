@@ -9,6 +9,7 @@
 {-# LANGUAGE FlexibleInstances #-}
 module Foreign.OCaml (caml_startup,
                       Marshal(..),
+                      Value,
                       register_closure,
                       block_constructor,
                       constant_constructor,
@@ -74,7 +75,7 @@ get_closure name = unsafePerformIO $
                    do ref <- withCString name caml_named_value
                       if ref == nullPtr then
                           error $ "Unregistered OCaml callback: " ++ name
-                      else peek ref
+                          else peek ref
 
 store_field :: Value -> Int -> Value -> IO ()
 store_field block offset val =
