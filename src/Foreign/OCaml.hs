@@ -114,6 +114,8 @@ string_tag = 252
 val_string :: String -> Value
 val_string x = unsafePerformIO $ withCString x caml_copy_string
 
+closure_tag = 247
+
 is_value :: Value -> Bool
 is_value v = testBit v 0
 
@@ -150,7 +152,6 @@ instance Marshal String where
 
 instance (Marshal a) => Marshal [a] where
     marshal (x:xs) = block_constructor 0 [marshal x, marshal xs]
-    marshal [x] = block_constructor 0 [marshal x, val_int 0]
     marshal [] = val_int 0
 
     unmarshal v = if is_block v then
