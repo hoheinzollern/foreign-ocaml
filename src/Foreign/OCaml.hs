@@ -6,7 +6,7 @@
    Maintainer  : albr@dtu.dk
  -}
 {-# LANGUAGE ForeignFunctionInterface #-}
-{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE FlexibleInstances, OverlappingInstances #-}
 module Foreign.OCaml (caml_startup,
                       Marshal(..),
                       Value,
@@ -129,6 +129,16 @@ get_tag v = if littleEndian then
                 unsafePerformIO $ peekByteOff (castPtr $ handle_val v) (-sizeOf v)
             else
                 unsafePerformIO $ peekByteOff (castPtr $ handle_val v) (-1)
+
+-- Attempt to create a generic constructor for algebraic data types, not working yet
+-- class Marshal (t :: *) where
+--     marshal :: t -> Value
+--     default marshal :: (Generic a, GMarshal (Rep a)) => a -> Value
+--     marshal = gmarshal . from
+--     unmarshal :: Value -> t
+
+-- class GMarshal (f :: Universe (* -> *) * m) where
+--     gmarshal :: Interprt f x -> Value
 
 class Marshal t where
     marshal :: t -> Value
