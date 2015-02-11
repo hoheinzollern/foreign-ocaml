@@ -16,7 +16,7 @@ data Tree a = Leaf a | Node (Tree a) (Tree a)
 
 -- A marshal instance for the algebraic data type, hopefully in the
 -- future it is not going to be needed
-instance Marshal a => Marshal (Tree a) where
+instance (Marshal a) => Marshal (Tree a) where
     -- Calling block_constructor with tag 0 and the list of marshalled
     -- arguments produces the first constructor definition in the
     -- OCaml side:
@@ -36,6 +36,7 @@ factorial = register_closure "factorial" :: Int -> Int
 sum = register_closure "sum" :: Int -> Int -> Int
 rotate_left = register_closure "rotate_left" :: Marshal a => Tree a -> Tree a
 rotate_right = register_closure "rotate_right" :: Marshal a => Tree a -> Tree a
+count = register_closure "count" :: () -> IO Int
 
 main = do
   -- required startup of the ocaml machinery
@@ -53,3 +54,8 @@ main = do
   putStrLn $ "Original tree: " ++ show t
   putStrLn $ "Left rotation: " ++ show t'
   putStrLn $ "Right rotation: " ++ show t''
+  -- IO values are strictly evaluated
+  n0 <- count ()
+  n1 <- count ()
+  putStrLn $ "n1 = " ++ show n1
+  putStrLn $ "n0 = " ++ show n0

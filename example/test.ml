@@ -14,6 +14,11 @@ let _ = Callback.register "sum" sum
 (* Defining an algebraic datatype representing a tree *)
 type 'a tree = Leaf of 'a | Node of 'a tree * 'a tree
 
+let count =
+  let count = ref (-1) in
+  fun () -> incr count; !count
+let _ = Callback.register "count" count
+
 (* Left rotation of the tree *)
 let rotate_left t = match t with
   | Node (a, Node (b, c)) -> Node (Node (a, b), c)

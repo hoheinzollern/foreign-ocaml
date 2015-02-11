@@ -7,6 +7,7 @@
  -}
 {-# LANGUAGE ForeignFunctionInterface #-}
 {-# LANGUAGE FlexibleInstances, OverlappingInstances #-}
+{-# LANGUAGE BangPatterns #-}
 module Foreign.OCaml (caml_startup,
                       Marshal(..),
                       Value,
@@ -144,6 +145,18 @@ class Marshal t where
     marshal :: t -> Value
     unmarshal :: Value -> t
 
+instance Marshal () where
+    marshal () = val_int 0
+    unmarshal 0x1 = ()
+    unmarshal _ = error "Unit value should be 1"
+
+instance Marshal Bool where
+    marshal False = val_int 0
+    marshal True = val_int 1
+    unmarshal 0x1 = False
+    unmarshal 0x3 = True
+    unmarshal _ = error "Booleans should be either true or false"
+
 instance Marshal Int where
     marshal = val_int
     unmarshal = int_val
@@ -186,7 +199,15 @@ instance (Marshal a, Marshal b) => Marshal (a -> b) where
 
 instance (Marshal a) => Marshal (IO a) where
     marshal x = marshal $ unsafePerformIO x
-    unmarshal v = return $ unmarshal v
+    unmarshal v = let !r = unmarshal v in
+                  return r
+
+-- TODO: consider using the lens package to marshal arbitrary tuples
+instance (Marshal a, Marshal b) => Marshal (a, b) where
+    marshal (a, b) = block_constructor 0 [marshal a, marshal b]
+    unmarshal v = case get_tag v of
+                    0 -> (unmarshal $ get_field v 0, unmarshal $ get_field v 1)
+                    _ -> error "OCaml tuples have should tag 0"
 
 register_closure :: Marshal a => String -> a
 register_closure name = unmarshal (get_closure name)
