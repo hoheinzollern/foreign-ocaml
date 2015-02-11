@@ -209,6 +209,24 @@ instance (Marshal a, Marshal b) => Marshal (a, b) where
                     0 -> (unmarshal $ get_field v 0, unmarshal $ get_field v 1)
                     _ -> error "OCaml tuples have should tag 0"
 
+instance (Marshal a, Marshal b, Marshal c) => Marshal (a, b, c) where
+    marshal (a, b, c) = block_constructor 0 [marshal a, marshal b, marshal c]
+    unmarshal v = case get_tag v of
+                    0 -> (unmarshal $ get_field v 0, unmarshal $ get_field v 1, unmarshal $ get_field v 2)
+                    _ -> error "OCaml tuples have should tag 0"
+
+instance (Marshal a, Marshal b, Marshal c, Marshal d) => Marshal (a, b, c, d) where
+    marshal (a, b, c, d) = block_constructor 0 [marshal a, marshal b, marshal c, marshal d]
+    unmarshal v = case get_tag v of
+                    0 -> (unmarshal $ get_field v 0, unmarshal $ get_field v 1, unmarshal $ get_field v 2, unmarshal $ get_field v 3)
+                    _ -> error "OCaml tuples have should tag 0"
+
+instance (Marshal a, Marshal b, Marshal c, Marshal d, Marshal e) => Marshal (a, b, c, d, e) where
+    marshal (a, b, c, d, e) = block_constructor 0 [marshal a, marshal b, marshal c, marshal d, marshal e]
+    unmarshal v = case get_tag v of
+                    0 -> (unmarshal $ get_field v 0, unmarshal $ get_field v 1, unmarshal $ get_field v 2, unmarshal $ get_field v 3, unmarshal $ get_field v 4)
+                    _ -> error "OCaml tuples have should tag 0"
+
 register_closure :: Marshal a => String -> a
 register_closure name = unmarshal (get_closure name)
 
