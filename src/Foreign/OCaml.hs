@@ -5,11 +5,14 @@
    License     : GPL-2
    Maintainer  : albr@dtu.dk
  -}
-{-# LANGUAGE ForeignFunctionInterface #-}
 {-# LANGUAGE FlexibleInstances, OverlappingInstances #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE DefaultSignatures #-}
+{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE ForeignFunctionInterface #-}
 module Foreign.OCaml (caml_startup,
                       Marshal(..),
+                      deriveMarshalInstance,
                       Value,
                       register_closure,
                       block_constructor,
@@ -20,11 +23,14 @@ module Foreign.OCaml (caml_startup,
                       get_field,
                       get_tag) where
 
+
 import Foreign.C
 import Foreign.Ptr
 import Foreign.Storable
 import Foreign.Marshal.Array
 import System.IO.Unsafe
+import Language.Haskell.TH
+import Control.Monad
 
 import Data.Binary
 import Data.Binary.Put
@@ -131,20 +137,22 @@ get_tag v = if littleEndian then
             else
                 unsafePerformIO $ peekByteOff (castPtr $ handle_val v) (-1)
 
--- Attempt to create a generic constructor for algebraic data types, not working yet
--- class Marshal (t :: *) where
---     marshal :: t -> Value
---     default marshal :: (Generic a, GMarshal (Rep a)) => a -> Value
---     marshal = gmarshal . from
---     unmarshal :: Value -> t
+constant_constructor = val_int
+block_constructor x args = unsafePerformIO $ do
+  r <- caml_alloc (fromIntegral $ length args) x
+  store_args r 0 args
+  return r
+    where store_args r i (x:xs) = do store_field r i x
+                                     store_args r (i+1) xs
+          store_args r i [] = return ()
 
--- class GMarshal (f :: Universe (* -> *) * m) where
---     gmarshal :: Interprt f x -> Value
+constant_destructor = int_val
+
 
 class Marshal t where
     marshal :: t -> Value
     unmarshal :: Value -> t
-
+                  
 instance Marshal () where
     marshal () = val_int 0
     unmarshal 0x1 = ()
@@ -229,14 +237,93 @@ instance (Marshal a, Marshal b, Marshal c, Marshal d, Marshal e) => Marshal (a, 
 
 register_closure :: Marshal a => String -> a
 register_closure name = unmarshal (get_closure name)
+                    
 
-constant_constructor = val_int
-block_constructor x args = unsafePerformIO $ do
-  r <- caml_alloc (fromIntegral $ length args) x
-  store_args r 0 args
-  return r
-    where store_args r i (x:xs) = do store_field r i x
-                                     store_args r (i+1) xs
-          store_args r i [] = return ()
+deriveMarshal t = do
+  TyConI (DataD _ _ tyvars constructors _) <- reify t
 
-constant_destructor = int_val
+  let marshalClause :: Int -> Int -> [Con] -> Q [Clause]
+      -- Constant constructors
+      marshalClause recordC emptyC (NormalC name []:cs) =
+          do d <- clause [conP name []]
+                  (normalB [| constant_constructor emptyC |]) []
+             ds <- marshalClause recordC (emptyC+1) cs
+             return (d:ds)
+      -- Constructors with fields
+      marshalClause recordC emptyC (NormalC name fields:cs) =
+          do (pats, vars) <- genPE (length fields)
+             let f [] = [| [] |]
+                 f (v:vars) = [| marshal $v : $(f vars) |]
+             d <- clause [conP name pats]
+                  (normalB [| block_constructor recordC $(f vars) |]) []
+             ds <- marshalClause (recordC+1) emptyC cs
+             return (d:ds)
+      marshalClause _ _ [] =
+          do return []
+
+  marshalBody <- marshalClause 0 0 constructors
+  return marshalBody
+
+deriveUnmarshal t = do
+  TyConI (DataD _ _ tyvars constructors _) <- reify t
+
+  v <- newName "v"
+  let vE = varE v
+  let vP = varP v
+
+  let unmarshalBlockCase :: Integer -> [Con] -> [MatchQ]
+      unmarshalBlockCase recordC (NormalC name []:cs) = unmarshalBlockCase recordC cs
+      unmarshalBlockCase recordC (NormalC name fields:cs) = (d:ds)
+          where f :: Q Exp -> Int -> Q Exp
+                f e n = if n > 0 then appE (f e (n-1)) [| unmarshal (get_field $(vE) (n-1)) |]
+                        else e
+                d = match (litP $ integerL recordC)
+                    (normalB (f (conE name) (length fields))) []
+                ds = unmarshalBlockCase (recordC+1) cs
+      unmarshalBlockCase _ [] = []
+
+  let unmarshalConstCase :: Integer -> [Con] -> [MatchQ]
+      unmarshalConstCase emptyC (NormalC name []:cs) = (d:ds)
+          where d = match (litP $ integerL emptyC)
+                    (normalB (appE (conE name) [| [] |])) []
+                ds = unmarshalConstCase (emptyC+1) cs
+      unmarshalConstCase emptyC (NormalC name fields:cs) = unmarshalConstCase emptyC cs
+      unmarshalConstCase _ [] = []
+
+  let constCases = unmarshalConstCase 0 constructors
+  let constCase = caseE [|val_int $(vE)|] constCases
+  let blockCases = unmarshalBlockCase 0 constructors
+  let blockCase = caseE [|get_tag $(vE)|] blockCases
+  unmarshalBody <-
+      case (constCases, blockCases) of
+        ([], []) -> error "No constructors! weird..."
+        (_, [])  -> clause [vP] (normalB constCase) []
+        ([], _)  -> clause [vP] (normalB blockCase) []
+        (_, _)   -> clause [vP] (normalB [| if is_block $(vE) then $(blockCase)
+                                            else $(constCase) |]) []
+  return unmarshalBody
+
+
+genPE n = do
+  ids <- replicateM n (newName "x")
+  return (map varP ids, map varE ids)
+
+data T = T
+
+deriveMarshalInstance t = do
+  t' <- reify t
+  case t' of
+    TyConI (DataD _ _ [] constructors _) -> do
+        marshalBody <- deriveMarshal t
+        unmarshalBody <- deriveUnmarshal t
+
+        d <- [d| instance Marshal T where
+                   marshal x = error "Unable to marshal T"
+                   unmarshal x = error "Unable to unmarshal T"
+              |]
+        let    [InstanceD [] (AppT marshalt (ConT _))
+                [FunD marshal_f m_err, FunD unmarshal_f unm_err]] = d
+        -- let cxt = [ClassP (mkName "Marshal") [VarT v] | PlainTV v <- tyvars] :: Cxt
+        return [InstanceD [] (AppT marshalt (ConT t))
+                [FunD marshal_f marshalBody, FunD unmarshal_f [unmarshalBody]]]
+    _ -> error $ "Type " ++ show t' ++ " not supported"

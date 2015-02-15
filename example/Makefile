@@ -15,4 +15,4 @@ test.o: test.ml
 	ocamlopt -output-obj -o test.o test.ml
 
 clean:
-	rm *{~,.o,.a,.hi,.cmi,.cmx}
+	rm *{~,.o,.a,.hi,.cmi,.cmx,.dyn_hi,.dyn_o}
