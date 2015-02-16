@@ -1,3 +1,5 @@
+open Unix
+
 (* Defining the factorial function *)
 let factorial n = 
   let rec f n a =
@@ -30,3 +32,9 @@ let rotate_right t = match t with
 (* Registering the callbacks *)
 let _ = Callback.register "rotate_left" rotate_left
 let _ = Callback.register "rotate_right" rotate_right
+
+let sleep_ocaml = Unix.sleep 1
+let _ = Callback.register "sleep" sleep_ocaml
+
+let get_tree () = Node (Leaf 1, Node (Leaf 2, Leaf 3))
+let _ = Callback.register "get_tree" get_tree

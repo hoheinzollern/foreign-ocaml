@@ -8,6 +8,7 @@
 {-# LANGUAGE ForeignFunctionInterface #-}
 {-# LANGUAGE FlexibleInstances, OverlappingInstances #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE DefaultSignatures, DeriveGeneric, TypeOperators, FlexibleContexts #-}
 module Foreign.OCaml (caml_startup,
                       Marshal(..),
                       Value,
@@ -32,6 +33,8 @@ import Data.Bits
 import Data.List
 import Data.Int
 import Data.Word
+
+import GHC.Generics
 
 type Value = CLong
 type ValueHandle = Ptr Value
@@ -98,6 +101,9 @@ val_cdouble x = unsafePerformIO $ caml_copy_double $ x
 cdouble_val :: Value -> CDouble
 cdouble_val x = unsafePerformIO $ peek $ castPtr $ handle_val x
 
+val_unit :: () -> Value
+val_unit () = val_int 0
+
 unit_val :: Value -> ()
 unit_val x = ()
 
@@ -131,19 +137,50 @@ get_tag v = if littleEndian then
             else
                 unsafePerformIO $ peekByteOff (castPtr $ handle_val v) (-1)
 
--- Attempt to create a generic constructor for algebraic data types, not working yet
--- class Marshal (t :: *) where
---     marshal :: t -> Value
---     default marshal :: (Generic a, GMarshal (Rep a)) => a -> Value
---     marshal = gmarshal . from
---     unmarshal :: Value -> t
-
--- class GMarshal (f :: Universe (* -> *) * m) where
---     gmarshal :: Interprt f x -> Value
-
 class Marshal t where
     marshal :: t -> Value
+
+    default marshal :: (Generic t, GMarshal (Rep t)) => t -> Value
+    marshal x = gmarshal (from x)
+
     unmarshal :: Value -> t
+
+    default unmarshal :: (Generic t, GMarshal (Rep t)) => Value -> t
+    unmarshal v = to (gunmarshal v)
+
+class GMarshal f where
+    gmarshal :: f a -> Value
+    gunmarshal :: Value -> f a
+
+-- | Unit: used for constructors without arguments
+instance GMarshal U1 where
+  gmarshal U1 = val_unit ()
+  gunmarshal v = U1
+
+-- | Products: encode multiple arguments to constructors
+instance (GMarshal a, GMarshal b) => GMarshal (a :*: b) where
+  gmarshal (a :*: b) = block_constructor 0 [gmarshal a, gmarshal b]
+  gunmarshal v = a :*: b
+    where a = gunmarshal (get_field v 0)
+          b = gunmarshal (get_field v 1)
+
+-- | Sums: encode choice between constructors
+instance (GMarshal a, GMarshal b) => GMarshal (a :+: b) where
+  gmarshal (L1 x) = block_constructor 0 [gmarshal x]
+  gmarshal (R1 x) = block_constructor 1 [gmarshal x]
+  gunmarshal v = case get_tag v of
+                   0x1 -> L1 (gunmarshal (get_field v 0))
+                   0x3 -> R1 (gunmarshal (get_field v 1))
+
+-- | Meta-information (constructor names, etc.)
+instance (GMarshal a) => GMarshal (M1 i c a) where
+  gmarshal (M1 x) = gmarshal x
+  gunmarshal v = M1 (gunmarshal v)
+
+-- | Constants, additional parameters and recursion of kind *
+instance (Marshal a) => GMarshal (K1 i a) where
+  gmarshal (K1 x) = marshal x
+  gunmarshal v = K1 (unmarshal v)
 
 instance Marshal () where
     marshal () = val_int 0
