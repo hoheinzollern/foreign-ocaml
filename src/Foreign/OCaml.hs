@@ -4,6 +4,24 @@
    Copyright   : (c) Alessandro Bruni 2014
    License     : GPL-2
    Maintainer  : albr@dtu.dk
+
+
+Haskell Foreign Function Interface (FFI) for OCaml.
+Allows integrating OCaml code into Haskell programs: right now the interface is still pretty rough, and there are probably terrible memory holes that we need to deal with, consider it as a proof of concept.
+
+It offers:
+
+* calling OCaml functions from Haskell;
+* serialization and deserialization of OCaml datatypes, including `unit`, `bool`, `int`, `double`, `string`, `list`s, `tuple`s and `option`s;
+* limited automatic suppport for serializing algebraic data types, works when there are no type variables (helper functions are provided for converting between the two representations, so custom serializations can be built)
+* strict and lazy evaluation, support for side effects
+
+Current limitations:
+
+* does not support passing higher order functions to OCaml (Haskell function serialization is not supported)
+* tuple serialization limited to tuples of 2 to 5 arguments
+* no handling of garbage collection, so your program might explode
+
  -}
 {-# LANGUAGE FlexibleInstances, OverlappingInstances #-}
 {-# LANGUAGE BangPatterns #-}
@@ -13,7 +31,7 @@
 module Foreign.OCaml (caml_startup,
                       Marshal(..),
                       deriveMarshalInstance,
-                      Value,
+                      Value,Tag,
                       register_closure,
                       block_constructor,
                       constant_constructor,
@@ -47,6 +65,7 @@ type CStringHandle = Ptr CString
 type CAMLRootsBlock = Ptr CLong
 
 type MLSize = CULong
+-- | Represents tags used in block constructors
 type Tag = CUInt
 
 -- Function calls
@@ -68,13 +87,21 @@ crbGetNext p = do
   x <- peekElemOff p 0
   return $ wordPtrToPtr $ fromIntegral x
 
--- | Startup for the OCaml runtime: call this function before using any
--- other function in this module.
+-- | Startup for the OCaml runtime: call this function before using
+-- any other function in this module. The list of arguments is fed to
+-- the OCaml runtime. For example:
+-- 
+-- @
+-- main = do
+--   args <- getArgs
+--   caml_startup args
+--   -- ..rest of the program..
+-- @
 caml_startup :: [String] -> IO ()
 caml_startup args = startup args []
 	where startup :: [String] -> [CString] -> IO ()
 	      startup (x:xs) args = withCString x (\x->startup xs (x:args))
-	      startup [] args = withArray (reverse (nullPtr:args)) _caml_startup 
+	      startup [] args = withArray (reverse (nullPtr:args)) _caml_startup
 
 caml_callbackN :: Value -> [Value] -> Value
 caml_callbackN cl args = unsafePerformIO $ withArray (reverse args)
@@ -185,12 +212,14 @@ class Marshal t where
     -- | `unmarshal` takes an OCaml value and returns its
     -- deserialization into a Haskell data type
     unmarshal :: Value -> t
-                  
+
+-- | Converts @()@ into `unit`
 instance Marshal () where
     marshal () = val_int 0
     unmarshal 0x1 = ()
     unmarshal _ = error "Unit value should be 1"
 
+-- | Converts "Bool" into `bool`
 instance Marshal Bool where
     marshal False = val_int 0
     marshal True = val_int 1
@@ -198,70 +227,114 @@ instance Marshal Bool where
     unmarshal 0x3 = True
     unmarshal _ = error "Booleans should be either true or false"
 
+-- | Represents the `int` datatype in OCaml. Be aware of the
+-- difference in representation between the OCaml and the Haskell
+-- datatypes: OCaml's `int` datatype is a 31 bit signed integer, while
+-- Haskell's "Int" is a 32 bit signed integer, hence the representable
+-- ranges vary.
 instance Marshal Int where
     marshal = val_int
     unmarshal = int_val
 
+-- | Converts an Haskell "Float" into an OCaml `float`, which is a
+-- double precision floating point value.
 instance Marshal Float where
     marshal = val_cdouble . realToFrac
     unmarshal = realToFrac . cdouble_val
 
+-- | Converts an Haskell "Double" into an OCaml `float`, which is a
+-- double precision floating point value.
 instance Marshal Double where
     marshal = val_cdouble . realToFrac
     unmarshal = realToFrac . cdouble_val
 
+-- | Converts an Haskell "String" into an OCaml `string`. Note that
+-- while the first is just an alias for ["Char"], `string` is a native
+-- datatype. Needs the extensions @-XFlexibleInstances@ and
+-- @-XOverlappingInstances@ in order to work properly.
 instance Marshal String where
     marshal = val_string
     unmarshal = string_val
 
+-- | Converts the Maybe monad to the corresponding OCaml datatype.
+instance (Marshal a) => Marshal (Maybe a) where
+    marshal (Just x)  = block_constructor 0 [marshal x]
+    marshal (Nothing) = constant_constructor 0
+
+    unmarshal v =
+        if is_block v then Just (unmarshal $ get_field v 0)
+        else Nothing
+
+-- | Converts an Haskell list into an OCaml list.
 instance (Marshal a) => Marshal [a] where
     marshal (x:xs) = block_constructor 0 [marshal x, marshal xs]
     marshal [] = val_int 0
 
-    unmarshal v = if is_block v then
-                      (unmarshal $ get_field v 0) : (unmarshal $ get_field v 1)
-                  else []
+    unmarshal v =
+        if is_block v then (unmarshal $ get_field v 0) : (unmarshal $ get_field v 1)
+        else []
 
+-- | Allows calling the C function @caml_callbackN@, by passing
+-- marshalled arguments in reverse order. It is supposed to be more
+-- efficient than the other forms, but is not general, so use it with
+-- care.
 instance (Marshal a) => Marshal ([Value]->a) where
     marshal f = error "Unable to marshal functions"
     unmarshal cl args = unmarshal $ caml_callbackN cl args
 
+-- | Applicative types: allows calling OCaml functions of type @a -> b
+-- -> c -> d@. Please note that marshalling is not supported, hence no
+-- functions can be passed as values to OCaml.
 instance (Marshal a, Marshal b, Marshal c, Marshal d) => Marshal (a->b->c->d) where
     marshal f = error "Unable to marshal functions"
     unmarshal cl x1 x2 x3 = unmarshal $ caml_callback3 cl (marshal x1) (marshal x2) (marshal x3)
 
+-- | Applicative types: allows calling OCaml functions of type @a -> b
+-- -> c@. Please note that marshalling is not supported, hence no
+-- functions can be passed as values to OCaml.
 instance (Marshal a, Marshal b, Marshal c) => Marshal (a->b->c) where
     marshal f = error "Unable to marshal functions"
     unmarshal cl x1 x2 = unmarshal $ caml_callback2 cl (marshal x1) (marshal x2)
 
+-- | Applicative types: allows calling OCaml functions of type @a ->
+-- b@. Please note that marshalling is not supported, hence no
+-- functions can be passed as values to OCaml.
 instance (Marshal a, Marshal b) => Marshal (a -> b) where
     marshal f = error "Unable to marshal functions"
     unmarshal cl x = unmarshal $ caml_callback cl $ marshal x
 
+-- | Use the "IO" monad to mark those functions that produce side
+-- effects to the system. The "IO" monad also enforces strict
+-- evaluation, hence the call is executed at the point where the
+-- function is called.
 instance (Marshal a) => Marshal (IO a) where
     marshal x = marshal $ unsafePerformIO x
     unmarshal v = let !r = unmarshal v in
                   return r
 
 -- TODO: consider using the lens package to marshal arbitrary tuples
+-- | Converts an Haskell 2-tuple into an OCaml 2-tuple and viceversa
 instance (Marshal a, Marshal b) => Marshal (a, b) where
     marshal (a, b) = block_constructor 0 [marshal a, marshal b]
     unmarshal v = case get_tag v of
                     0 -> (unmarshal $ get_field v 0, unmarshal $ get_field v 1)
                     _ -> error "OCaml tuples have should tag 0"
 
+-- | Converts an Haskell 3-tuple into an OCaml 3-tuple and viceversa
 instance (Marshal a, Marshal b, Marshal c) => Marshal (a, b, c) where
     marshal (a, b, c) = block_constructor 0 [marshal a, marshal b, marshal c]
     unmarshal v = case get_tag v of
                     0 -> (unmarshal $ get_field v 0, unmarshal $ get_field v 1, unmarshal $ get_field v 2)
                     _ -> error "OCaml tuples have should tag 0"
 
+-- | Converts an Haskell 4-tuple into an OCaml 4-tuple and viceversa
 instance (Marshal a, Marshal b, Marshal c, Marshal d) => Marshal (a, b, c, d) where
     marshal (a, b, c, d) = block_constructor 0 [marshal a, marshal b, marshal c, marshal d]
     unmarshal v = case get_tag v of
                     0 -> (unmarshal $ get_field v 0, unmarshal $ get_field v 1, unmarshal $ get_field v 2, unmarshal $ get_field v 3)
                     _ -> error "OCaml tuples have should tag 0"
 
+-- | Converts an Haskell 5-tuple into an OCaml 5-tuple and viceversa
 instance (Marshal a, Marshal b, Marshal c, Marshal d, Marshal e) => Marshal (a, b, c, d, e) where
     marshal (a, b, c, d, e) = block_constructor 0 [marshal a, marshal b, marshal c, marshal d, marshal e]
     unmarshal v = case get_tag v of
@@ -275,7 +348,7 @@ instance (Marshal a, Marshal b, Marshal c, Marshal d, Marshal e) => Marshal (a, 
 -- let _ = Callback.register "f" f
 -- @
 --
--- If `f` is a function of OCaml type `int -> int` then it can be
+-- If `f` is a function of OCaml type @int -> int@ then it can be
 -- registered with:
 --
 -- @
@@ -303,7 +376,7 @@ instance (Marshal a, Marshal b, Marshal c, Marshal d, Marshal e) => Marshal (a, 
 -- linearize = register_closure "linearize" :: Tree a -> [a]
 -- @
 --
--- provided that an implementation of "Tree a" and "Marshal" for both "Tree a" and "a" exist.
+-- provided that an implementation of @Tree a@ and "Marshal" for both @Tree a@ and @a@ exist.
 register_closure :: Marshal a => String -> a
 register_closure name = unmarshal (get_closure name)
                     
@@ -388,7 +461,7 @@ data T = T
 -- @
 --
 -- Simply produce a corresponding Haskell data type, then call
--- "deriveMarshalInstance" to obtain two way conversion between the
+-- `deriveMarshalInstance` to obtain two way conversion between the
 -- Haskell and OCaml representations:
 --
 -- @

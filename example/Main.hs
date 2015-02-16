@@ -23,6 +23,7 @@ sum = register_closure "sum" :: Int -> Int -> Int
 rotate_left = register_closure "rotate_left" :: TreeString -> TreeString
 rotate_right = register_closure "rotate_right" :: TreeString -> TreeString
 count = register_closure "count" :: () -> IO Int
+print_neg = register_closure "print_neg" :: Int -> IO Int
 
 main = do
   -- required startup of the ocaml machinery
@@ -40,6 +41,8 @@ main = do
   putStrLn $ "Original tree: " ++ show t
   putStrLn $ "Left rotation: " ++ show t'
   putStrLn $ "Right rotation: " ++ show t''
+  x <- print_neg (-10) -- FIXME: does not print a value
+  putStrLn $ show x
   -- IO values are strictly evaluated
   n0 <- count ()
   n1 <- count ()

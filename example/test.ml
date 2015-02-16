@@ -30,3 +30,7 @@ let rotate_right t = match t with
 (* Registering the callbacks *)
 let _ = Callback.register "rotate_left" rotate_left
 let _ = Callback.register "rotate_right" rotate_right
+
+let print_neg x = print_int x; print_string "\n"; x+1
+
+let _ = Callback.register "print_neg" print_neg
