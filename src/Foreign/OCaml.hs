@@ -17,9 +17,8 @@ module Foreign.OCaml (caml_startup,
                       register_closure,
                       block_constructor,
                       constant_constructor,
-                      --block_destructor,
-                      constant_destructor,
-                      is_block,
+                      is_block,is_value,
+                      get_const,
                       get_field,
                       get_tag) where
 
@@ -39,6 +38,7 @@ import Data.List
 import Data.Int
 import Data.Word
 
+-- | Opaque datatype that represents an OCaml object.
 type Value = CLong
 type ValueHandle = Ptr Value
 
@@ -68,6 +68,8 @@ crbGetNext p = do
   x <- peekElemOff p 0
   return $ wordPtrToPtr $ fromIntegral x
 
+-- | Startup for the OCaml runtime: call this function before using any
+-- other function in this module.
 caml_startup :: [String] -> IO ()
 caml_startup args = startup args []
 	where startup :: [String] -> [CString] -> IO ()
@@ -87,10 +89,6 @@ get_closure name = unsafePerformIO $
 store_field :: Value -> Int -> Value -> IO ()
 store_field block offset val =
     caml_modify (plusPtr (handle_val block) (offset * sizeOf val)) val
-
-get_field :: Value -> Int -> Value
-get_field block offset =
-    unsafePerformIO $ peekElemOff (handle_val block) offset
 
 val_int :: Int -> Value
 val_int x = fromIntegral ((shiftL x 1) + 1)
@@ -123,21 +121,29 @@ val_string x = unsafePerformIO $ withCString x caml_copy_string
 
 closure_tag = 247
 
+-- | True if `v` is an atomic value
 is_value :: Value -> Bool
 is_value v = testBit v 0
 
+-- | True if `v` is a block constructor
 is_block :: Value -> Bool
 is_block v = not $ is_value v
 
 littleEndian =  (decode $ runPut $ putWord16host 42 :: Word8) == 42
 
-get_tag :: Value -> CUChar
-get_tag v = if littleEndian then
-                unsafePerformIO $ peekByteOff (castPtr $ handle_val v) (-sizeOf v)
-            else
-                unsafePerformIO $ peekByteOff (castPtr $ handle_val v) (-1)
-
+-- | Produces a constant constructor, that is, a constructor that has
+-- no parameters. The integer parameter is the index of the constant
+-- constructor, in order of appearance on the declaration of the
+-- datatype, counting from 0 and not considering block constructors.
+constant_constructor :: Int -> Value
 constant_constructor = val_int
+
+-- | Produces a block constructor, that is, a constructor with
+-- arguments. The integer pararmeter is the index of the block
+-- constructor, in order of appearance on the declaration of the
+-- datatype, counting from 0 and not considering constant
+-- constructors.
+block_constructor :: Tag -> [Value] -> Value
 block_constructor x args = unsafePerformIO $ do
   r <- caml_alloc (fromIntegral $ length args) x
   store_args r 0 args
@@ -146,11 +152,38 @@ block_constructor x args = unsafePerformIO $ do
                                      store_args r (i+1) xs
           store_args r i [] = return ()
 
-constant_destructor = int_val
+-- | Returns the index for a constant constructor, inverse of
+-- `constant_constructor`.
+get_const :: Value -> Int
+get_const = int_val
 
+-- | Returns a field in position `offset` from a block constructor.
+get_field :: Value -> Int -> Value
+get_field block offset =
+    unsafePerformIO $ peekElemOff (handle_val block) offset
 
+-- | Returns the idnex for a block constructor, more or less an
+-- inverse of `block_constructor`, to be used together with `get_field`
+get_tag :: Value -> CUChar
+get_tag v = if littleEndian then
+                unsafePerformIO $ peekByteOff (castPtr $ handle_val v) (-sizeOf v)
+            else
+                unsafePerformIO $ peekByteOff (castPtr $ handle_val v) (-1)
+
+-- | "Marshal" provides functions for transforming a Haskell
+-- representation of data into OCaml and viceversa.  Default
+-- implementations are given for all basic types: "Unit", "Bool",
+-- "Int", "Float", "Double", "String"; and dependent declarations
+-- allow to construct "Marshal" implementations for lists, tuples and
+-- applicative types.  Note that for applicative types the `marshal`
+-- function is not implemented, so it is not (yet) possible to pass
+-- higher order values.
 class Marshal t where
+    -- | `marshal` takes a Haskell value of type `t` and produces an
+    -- opaque OCaml value.
     marshal :: t -> Value
+    -- | `unmarshal` takes an OCaml value and returns its
+    -- deserialization into a Haskell data type
     unmarshal :: Value -> t
                   
 instance Marshal () where
@@ -235,6 +268,42 @@ instance (Marshal a, Marshal b, Marshal c, Marshal d, Marshal e) => Marshal (a, 
                     0 -> (unmarshal $ get_field v 0, unmarshal $ get_field v 1, unmarshal $ get_field v 2, unmarshal $ get_field v 3, unmarshal $ get_field v 4)
                     _ -> error "OCaml tuples have should tag 0"
 
+-- | `register_closure` returns a closure of type a for any OCaml name
+-- that has been registered with:
+--
+-- @
+-- let _ = Callback.register "f" f
+-- @
+--
+-- If `f` is a function of OCaml type `int -> int` then it can be
+-- registered with:
+--
+-- @
+-- f = register_closure "f" :: Int -> Int
+-- @
+--
+-- `register_closure` works with type variables as well, as long as
+-- all its instantiations are also instance of "Marshal". For example
+-- the function `linearize` that takes a tree and returns a list, with
+-- parameter type `a`:
+--
+-- @
+-- type 'a tree = Leaf of 'a | Node of 'a tree * 'a tree;;
+-- let rec linearize t = match t with
+--   | Leaf(x)   -> [x]
+--   | Node(l,r) -> let ll = linearize l in
+--                  let lr = linearize r in
+--                  ll @ lr;;
+-- let _ = Callback.register "linearize" linearize
+-- @
+--
+-- can be registered as such:
+--
+-- @
+-- linearize = register_closure "linearize" :: Tree a -> [a]
+-- @
+--
+-- provided that an implementation of "Tree a" and "Marshal" for both "Tree a" and "a" exist.
 register_closure :: Marshal a => String -> a
 register_closure name = unmarshal (get_closure name)
                     
@@ -310,6 +379,22 @@ genPE n = do
 
 data T = T
 
+-- | Automatically generate an instance of "Marshal" given a datatype.
+-- If you have an OCaml data type with no type variables and multiple
+-- constructors:
+--
+-- @
+-- type t = C1 of int * string | C2 of t * t | C3
+-- @
+--
+-- Simply produce a corresponding Haskell data type, then call
+-- "deriveMarshalInstance" to obtain two way conversion between the
+-- Haskell and OCaml representations:
+--
+-- @
+-- data T = C1 Int String | C2 T T | C3
+-- $(deriveMarshalInstance ''T)
+-- @
 deriveMarshalInstance t = do
   t' <- reify t
   case t' of
