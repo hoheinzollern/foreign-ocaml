@@ -25,13 +25,14 @@ Current limitations:
 
  -}
 {-# LANGUAGE FlexibleInstances, OverlappingInstances #-}
+{-# LANGUAGE DeriveDataTypeable, ScopedTypeVariables #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DefaultSignatures #-}
-{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE ForeignFunctionInterface #-}
 module Foreign.OCaml (caml_startup,
                       Marshal(..),
-                      deriveMarshalInstance,
+                      GMarshal(..),
                       Value,Tag,
                       register_closure,
                       block_constructor,
@@ -39,7 +40,9 @@ module Foreign.OCaml (caml_startup,
                       is_block,is_value,
                       get_const,
                       get_field,
-                      get_tag) where
+                      get_tag,
+                      module Data.Data,
+                      module Data.Typeable) where
 
 
 import Foreign.C
@@ -47,12 +50,16 @@ import Foreign.Ptr
 import Foreign.Storable
 import Foreign.Marshal.Array
 import System.IO.Unsafe
-import Language.Haskell.TH
+import Control.Applicative
 import Control.Monad
+import qualified Control.Monad.State as CMS
 
 import Data.Binary
 import Data.Binary.Put
 import Data.Bits
+import Data.Data
+import Data.Generics.Aliases
+import Data.Typeable
 import Data.List
 import Data.Int
 import Data.Word
@@ -67,7 +74,7 @@ type CAMLRootsBlock = Ptr CLong
 
 type MLSize = CULong
 -- | Represents tags used in block constructors
-type Tag = CUInt
+type Tag = CUChar
 
 -- Function calls
 foreign import ccall "caml_named_value" caml_named_value :: CString -> IO ValueHandle
@@ -118,6 +125,12 @@ store_field :: Value -> Int -> Value -> IO ()
 store_field block offset val =
     caml_modify (plusPtr (handle_val block) (offset * sizeOf val)) val
 
+val_uchar :: CUChar -> Value
+val_uchar x = fromIntegral ((shiftL x 1) + 1)
+
+uchar_val :: Value -> CUChar
+uchar_val x = fromIntegral (shiftR x 1)
+
 val_int :: Int -> Value
 val_int x = fromIntegral ((shiftL x 1) + 1)
 
@@ -163,8 +176,8 @@ littleEndian =  (decode $ runPut $ putWord16host 42 :: Word8) == 42
 -- no parameters. The integer parameter is the index of the constant
 -- constructor, in order of appearance on the declaration of the
 -- datatype, counting from 0 and not considering block constructors.
-constant_constructor :: Int -> Value
-constant_constructor = val_int
+constant_constructor :: Tag -> Value
+constant_constructor = val_uchar
 
 -- | Produces a block constructor, that is, a constructor with
 -- arguments. The integer pararmeter is the index of the block
@@ -182,8 +195,8 @@ block_constructor x args = unsafePerformIO $ do
 
 -- | Returns the index for a constant constructor, inverse of
 -- `constant_constructor`.
-get_const :: Value -> Int
-get_const = int_val
+get_const :: Value -> Tag
+get_const = uchar_val
 
 -- | Returns a field in position `offset` from a block constructor.
 get_field :: Value -> Int -> Value
@@ -192,7 +205,7 @@ get_field block offset =
 
 -- | Returns the idnex for a block constructor, more or less an
 -- inverse of `block_constructor`, to be used together with `get_field`
-get_tag :: Value -> CUChar
+get_tag :: Value -> Tag
 get_tag v = if littleEndian then
                 unsafePerformIO $ peekByteOff (castPtr $ handle_val v) (-sizeOf v)
             else
@@ -380,109 +393,86 @@ instance (Marshal a, Marshal b, Marshal c, Marshal d, Marshal e) => Marshal (a, 
 -- provided that an implementation of @Tree a@ and "Marshal" for both @Tree a@ and @a@ exist.
 register_closure :: Marshal a => String -> a
 register_closure name = unmarshal (get_closure name)
-                    
 
-deriveMarshal t = do
-  TyConI (DataD _ _ tyvars constructors _) <- reify t
-
-  let marshalClause :: Int -> Int -> [Con] -> Q [Clause]
-      -- Constant constructors
-      marshalClause recordC emptyC (NormalC name []:cs) =
-          do d <- clause [conP name []]
-                  (normalB [| constant_constructor emptyC |]) []
-             ds <- marshalClause recordC (emptyC+1) cs
-             return (d:ds)
-      -- Constructors with fields
-      marshalClause recordC emptyC (NormalC name fields:cs) =
-          do (pats, vars) <- genPE (length fields)
-             let f [] = [| [] |]
-                 f (v:vars) = [| marshal $v : $(f vars) |]
-             d <- clause [conP name pats]
-                  (normalB [| block_constructor recordC $(f vars) |]) []
-             ds <- marshalClause (recordC+1) emptyC cs
-             return (d:ds)
-      marshalClause _ _ [] =
-          do return []
-
-  marshalBody <- marshalClause 0 0 constructors
-  return marshalBody
-
-deriveUnmarshal t = do
-  TyConI (DataD _ _ tyvars constructors _) <- reify t
-
-  v <- newName "v"
-  let vE = varE v
-  let vP = varP v
-
-  let unmarshalBlockCase :: Integer -> [Con] -> [MatchQ]
-      unmarshalBlockCase recordC (NormalC name []:cs) = unmarshalBlockCase recordC cs
-      unmarshalBlockCase recordC (NormalC name fields:cs) = (d:ds)
-          where f :: Q Exp -> Int -> Q Exp
-                f e n = if n > 0 then appE (f e (n-1)) [| unmarshal (get_field $(vE) (n-1)) |]
-                        else e
-                d = match (litP $ integerL recordC)
-                    (normalB (f (conE name) (length fields))) []
-                ds = unmarshalBlockCase (recordC+1) cs
-      unmarshalBlockCase _ [] = []
-
-  let unmarshalConstCase :: Integer -> [Con] -> [MatchQ]
-      unmarshalConstCase emptyC (NormalC name []:cs) = (d:ds)
-          where d = match (litP $ integerL emptyC)
-                    (normalB (appE (conE name) [| [] |])) []
-                ds = unmarshalConstCase (emptyC+1) cs
-      unmarshalConstCase emptyC (NormalC name fields:cs) = unmarshalConstCase emptyC cs
-      unmarshalConstCase _ [] = []
-
-  let constCases = unmarshalConstCase 0 constructors
-  let constCase = caseE [|val_int $(vE)|] constCases
-  let blockCases = unmarshalBlockCase 0 constructors
-  let blockCase = caseE [|get_tag $(vE)|] blockCases
-  unmarshalBody <-
-      case (constCases, blockCases) of
-        ([], []) -> error "No constructors! weird..."
-        (_, [])  -> clause [vP] (normalB constCase) []
-        ([], _)  -> clause [vP] (normalB blockCase) []
-        (_, _)   -> clause [vP] (normalB [| if is_block $(vE) then $(blockCase)
-                                            else $(constCase) |]) []
-  return unmarshalBody
+data CT = EmptyC Tag | BlockC Tag
+          deriving (Eq, Show)
 
 
-genPE n = do
-  ids <- replicateM n (newName "x")
-  return (map varP ids, map varE ids)
+class GMarshal a where
+    gmarshal :: a -> Value
+    gunmarshal :: Value -> a
 
-data T = T
+instance (GMarshal a) => Marshal a where
+    marshal = gmarshal
+    unmarshal = gunmarshal
 
--- | Automatically generate an instance of "Marshal" given a datatype.
--- If you have an OCaml data type with no type variables and multiple
--- constructors:
---
--- @
--- type t = C1 of int * string | C2 of t * t | C3
--- @
---
--- Simply produce a corresponding Haskell data type, then call
--- `deriveMarshalInstance` to obtain two way conversion between the
--- Haskell and OCaml representations:
---
--- @
--- data T = C1 Int String | C2 T T | C3
--- $(deriveMarshalInstance ''T)
--- @
-deriveMarshalInstance t = do
-  t' <- reify t
-  case t' of
-    TyConI (DataD _ _ [] constructors _) -> do
-        marshalBody <- deriveMarshal t
-        unmarshalBody <- deriveUnmarshal t
+isBlockC :: forall d. Data d => Proxy d -> Constr -> Bool
+isBlockC _ c = getConst $ gfoldl (\_ _ -> Const True) (\_ -> Const False) (fromConstr c :: d)
 
-        d <- [d| instance Marshal T where
-                   marshal x = error "Unable to marshal T"
-                   unmarshal x = error "Unable to unmarshal T"
-              |]
-        let    [InstanceD [] (AppT marshalt (ConT _))
-                [FunD marshal_f m_err, FunD unmarshal_f unm_err]] = d
-        -- let cxt = [ClassP (mkName "Marshal") [VarT v] | PlainTV v <- tyvars] :: Cxt
-        return [InstanceD [] (AppT marshalt (ConT t))
-                [FunD marshal_f marshalBody, FunD unmarshal_f [unmarshalBody]]]
-    _ -> error $ "Type " ++ show t' ++ " not supported"
+instance (Data a) => GMarshal a where
+    gmarshal = gmarshal'
+               `extQ` (marshal :: () -> Value)
+               `extQ` (marshal :: Bool -> Value)
+               `extQ` (marshal :: Int -> Value)
+               `extQ` (marshal :: Float -> Value)
+               `extQ` (marshal :: Double -> Value)
+               `extQ` (marshal :: String -> Value)
+               `extQ` (marshal :: Maybe a -> Value)
+               `extQ` (marshal :: [a] -> Value)
+        where gmarshal' x =
+                  case idx of
+                    EmptyC i -> constant_constructor i
+                    BlockC i -> block_constructor i margs
+                  where d = dataTypeOf x
+                        cs = dataTypeConstrs d
+                        c = toConstr x
+                        idx = find cs c (0, 0)
+                        pr = undefined :: Proxy a
+                        find (c:cs) c' (i, j) =
+                            if isBlockC pr c then
+                                if c == c' then BlockC j
+                                else find cs c' (i, j+1)
+                            else
+                                if c == c' then EmptyC i
+                                else find cs c' (i+1, j)
+                        find [] c idx = error $ "Constructor not found, this should never happen" ++ show c ++ show idx
+                        margs = gmapQ gmarshal x
+
+    gunmarshal = gunmarshal'
+                 `extB` (unmarshal :: Value -> ())
+                 `extB` (unmarshal :: Value -> Bool)
+                 `extB` (unmarshal :: Value -> Int)
+                 `extB` (unmarshal :: Value -> Float)
+                 `extB` (unmarshal :: Value -> Double)
+                 `extB` (unmarshal :: Value -> String)
+                 `extB` (unmarshal :: Value -> Maybe a)
+                 `extB` (unmarshal :: Value -> [a])
+        where gunmarshal' v =
+                  blockV
+                  where -- Determine result type
+                    d = dataTypeOf (getArg blockV)
+                        where
+                          getArg :: GMarshal a' => a' -> a'
+                          getArg = undefined
+                    cs = dataTypeConstrs d
+                    cid = if is_block v then BlockC $ get_tag v
+                          else EmptyC $ get_const v
+                    con = find cs cid
+                    blockV = CMS.evalState (fromConstrM unmarshalArg con) 0 :: a
+                    unmarshalArg :: forall a. Data a => CMS.State Int a
+                    unmarshalArg = do
+                      x <- CMS.get
+                      CMS.put (x+1)
+                      return (gunmarshal (get_field v x))
+                    pr = undefined :: Proxy a
+                    find (c:cs) (EmptyC i) =
+                        if isBlockC pr c then
+                            find cs (EmptyC i)
+                        else if i == 0 then c
+                             else find cs (EmptyC $ i-1)
+                    find (c:cs) (BlockC i) =
+                        if isBlockC pr c then
+                            if i == 0 then c
+                            else find cs (BlockC $ i-1)
+                        else find cs (BlockC i)
+                    find [] x = error $ "Constructor not found, this should never happen" ++ show x
