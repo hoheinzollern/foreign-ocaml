@@ -14,6 +14,7 @@ It offers:
 Current limitations:
 
 * does not support passing higher order functions to OCaml (Haskell function serialization is not supported)
+* does not support OCaml objects and classes
 * tuple serialization limited to tuples of 2 to 5 arguments
 * no handling of garbage collection, so your program might explode
 
